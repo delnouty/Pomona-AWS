@@ -75,6 +75,8 @@ Sorties dans le dossier `--output` : `Results/` (features, 1 280 valeurs), `Resu
 | `requirements.txt` | versions figées : PySpark 3.5.3, TensorFlow CPU 2.16.2, Keras 3.5.0, NumPy 1.26.4, pandas 2.2.3, PyArrow 17.0.0, Pillow 10.4.0 |
 | `aws/` | scripts de déploiement sur AWS EMR, fournis à titre de référence |
 | `.gitignore`, `.gitattributes` | exclusions (données, résultats, clés, environnements) ; fins de ligne LF pour les scripts `.sh` |
+| `.pre-commit-config.yaml`, `ruff.toml`, `requirements-dev.txt` | contrôles locaux à chaque commit (voir « Contribuer ») |
+| `.github/workflows/ci.yml` | intégration continue sur GitHub Actions |
 
 ## Périmètre et état
 
@@ -86,7 +88,40 @@ Sorties dans le dossier `--output` : `Results/` (features, 1 280 valeurs), `Resu
 
 Contraintes du sujet : en cas de déploiement cloud, serveurs situés dans l'Union européenne (RGPD) et coût maîtrisé (cluster allumé uniquement pour les tests). Les images Fruits-360 ne contiennent pas de données personnelles ; une exécution locale ne transfère aucune donnée.
 
-## Branches
+## Contribuer
 
-- `develop` : travail en cours.
-- `main` : versions stables ; pas de poussée directe.
+### Branches
+
+- `main` : versions stables. Pas de commit direct : un hook l'empêche en local.
+- `develop` : intégration du travail en cours.
+- Pour une modification : créer une branche depuis `develop` (par exemple `feature/ma-modification`), puis ouvrir une pull request vers `develop`.
+
+### Installer les contrôles locaux (pre-commit)
+
+À faire une fois, **depuis l'environnement dans lequel vous faites vos commits** : le hook mémorise l'interpréteur Python utilisé à l'installation.
+
+Linux ou WSL :
+
+```bash
+python3 -m venv ~/venvs/dev && source ~/venvs/dev/bin/activate
+pip install -r requirements-dev.txt
+pre-commit install
+```
+
+Windows (PowerShell) :
+
+```powershell
+py -3.12 -m pip install -r requirements-dev.txt
+py -3.12 -m pre_commit install
+```
+
+Pour contrôler tout le dépôt à la main : `pre-commit run --all-files` (la première exécution télécharge les environnements des hooks, donc nécessite internet).
+
+### Ce qui est contrôlé
+
+| Où | Contrôles |
+| --- | --- |
+| Hooks locaux, à chaque commit | pas de commit sur `main` ; fichiers de plus de 1 Mo ; clés privées ; marqueurs de conflit ; YAML valide ; espaces en fin de ligne et fin de fichier (notebooks exclus) ; lint et format avec `ruff` |
+| CI GitHub Actions, à chaque push et pull request vers `develop` ou `main` | les mêmes hooks (sauf l'interdiction de commit sur `main`) ; syntaxe de `src/pipeline.py` ; notebook en JSON valide ; recherche de secrets avec `gitleaks` |
+
+**Limite actuelle :** il n'y a pas encore de tests unitaires. La CI vérifie le style, l'hygiène du dépôt et l'absence de secrets, pas le comportement du pipeline.

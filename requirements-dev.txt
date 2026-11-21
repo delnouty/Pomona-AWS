@@ -1,0 +1,2 @@
+# Outils de développement (hors exécution du pipeline)
+pre-commit==4.7.0

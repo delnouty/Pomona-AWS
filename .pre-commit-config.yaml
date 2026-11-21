@@ -1,0 +1,26 @@
+# Contrôles lancés à chaque commit (pre-commit) et rejoués par la CI (.github/workflows/ci.yml).
+# Installation : pip install -r requirements-dev.txt && pre-commit install
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # pas de commit direct sur main : le travail passe par develop
+      - id: no-commit-to-branch
+        args: [--branch, main]
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: detect-private-key
+      - id: check-merge-conflict
+      - id: check-yaml
+      # les notebooks sont exclus : leur JSON contient des sorties que l'on ne veut pas modifier
+      - id: end-of-file-fixer
+        exclude: \.ipynb$
+      - id: trailing-whitespace
+        exclude: \.ipynb$
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.6
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
