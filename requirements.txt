@@ -1,0 +1,12 @@
+# Mêmes versions que le manuel (P8_Textbook) : local et cluster doivent avoir le même jeu.
+# Environnement local : WSL Ubuntu 24.04, Python 3.12, Java 17 requis par Spark.
+# keras==3.5.0 : les Keras plus récents demandent un Python plus récent que celui d'EMR 7.
+pyspark==3.5.3
+tensorflow-cpu==2.16.2
+keras==3.5.0
+numpy==1.26.4
+pandas==2.2.3
+pyarrow==17.0.0
+pillow==10.4.0
+matplotlib
+jupyterlab

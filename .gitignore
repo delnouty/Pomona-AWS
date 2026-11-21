@@ -1,0 +1,22 @@
+# Images and results are not versioned: too large
+data/
+# Secrets must never be committed
+*.pem
+.aws/
+# Local tools
+.venv/
+.vscode/
+.ipynb_checkpoints/
+__pycache__/
+spark-warehouse/
+metastore_db/
+derby.log
+# Résultats locaux du pipeline
+output/
+# Matériel de cours tiers : local uniquement, non publié
+docs/P8_Textbook.pdf
+docs/mode_operatoire/
+notebooks/00_alternant_original.ipynb
+# Anciennes versions du notebook : locales uniquement
+notebooks/P8_notebook_old.ipynb
+notebooks/P8_notebook_v1.2.ipynb

@@ -1,0 +1,4 @@
+# Texte normalisé en LF dans le dépôt
+* text=auto
+# Les scripts shell doivent rester en LF, y compris sous Windows (ils tournent dans WSL)
+*.sh text eol=lf
