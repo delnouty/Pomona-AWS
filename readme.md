@@ -12,8 +12,6 @@ La start-up AgriTech *Fruits!* veut identifier des fruits à partir de photos. C
 4. **Réduction de dimension** : centrage des features, puis PCA de Spark ML. Le nombre de composantes k est le plus petit qui conserve 90 % de la variance.
 5. **Écriture et validation** : résultats en Parquet, courbe de variance en CSV ; contrôle du nombre de lignes et de la taille des vecteurs avant et après la PCA.
 
-Le centrage est nécessaire : le `transform` de la PCA de Spark ne soustrait pas la moyenne, donc sans lui les coordonnées enregistrées seraient décalées d'un vecteur constant.
-
 ## Résultats mesurés
 
 Mesures locales (WSL Ubuntu, 4 cores) sur le jeu Fruits-360 :
@@ -24,12 +22,6 @@ Mesures locales (WSL Ubuntu, 4 cores) sur le jeu Fruits-360 :
 | `notebooks/P8_notebook.ipynb`, section 3 | 1 492 | 10 | 44 | extraction 17 s, PCA 5 s |
 
 Ces valeurs de k dépendent de l'échantillon : sur la totalité des 22 688 images de `Test`, elles seront différentes.
-
-## Points d'attention mesurés
-
-- **Utiliser plus d'images que de features (au moins ~1 500) pour tester la PCA.** Avec 300 images (moins que les 1 280 features), la PCA de Spark a renvoyé des composantes fausses et différentes d'un lancement à l'autre : pour le même k = 95, la variance captée valait 90,1 % deux fois et 58,9 % une fois ; pour k = 50, 44,6 % au lieu de 79,7 %. Avec 3 000 images, Spark coïncide avec un calcul NumPy de référence sur tous les ajustements répétés. La cause exacte n'est pas établie ; le cas coïncide avec un nombre d'images inférieur au nombre de features. Le script affiche un `ATTENTION` quand l'échantillon est trop petit ou quand la courbe et le modèle ajusté divergent.
-- **Limiter les cores en local (`--cores 4` par défaut).** Chaque tâche lance un worker Python qui charge TensorFlow. Avec `local[*]` sur 22 cores, le processus Spark s'est arrêté sur 3 000 images. Cause probable : la mémoire, non confirmée par un journal système.
-- **Lire les images depuis le système de fichiers Linux.** Sous WSL, 300 images : 2 min 28 depuis le disque Windows (`/mnt/c`), 41 s depuis le disque Linux.
 
 ## Lancer en local
 
@@ -70,18 +62,20 @@ Sorties dans le dossier `--output` : `Results/` (features, 1 280 valeurs), `Resu
 
 | Fichier | Rôle |
 | --- | --- |
-| `src/pipeline.py` | chaîne complète en un script (local ou cluster) |
+| `src/pipeline.py` | chaîne complète en un script (local ou cluster) : orchestration Spark et extraction des features |
+| `src/pipeline_utils.py` | fonctions pures du pipeline (choix de k, décodage des images, contrôles, arguments), sans Spark ni TensorFlow ; testées unitairement |
 | `notebooks/P8_notebook.ipynb` | notebook explicatif |
 | `requirements.txt` | versions figées : PySpark 3.5.3, TensorFlow CPU 2.16.2, Keras 3.5.0, NumPy 1.26.4, pandas 2.2.3, PyArrow 17.0.0, Pillow 10.4.0 |
 | `aws/` | scripts de déploiement sur AWS EMR, fournis à titre de référence |
 | `.gitignore`, `.gitattributes` | exclusions (données, résultats, clés, environnements) ; fins de ligne LF pour les scripts `.sh` |
 | `.pre-commit-config.yaml`, `ruff.toml`, `requirements-dev.txt` | contrôles locaux à chaque commit (voir « Contribuer ») |
 | `.github/workflows/ci.yml` | intégration continue sur GitHub Actions |
+| `tests/`, `pytest.ini`, `requirements-test.txt` | tests unitaires de `src/pipeline_utils.py` et leurs dépendances (voir « Contribuer ») |
 
 ## Périmètre et état
 
 - [x] Chaîne PySpark complète : chargement, extraction MobileNetV2, broadcast des poids, centrage, PCA, validation
-- [x] Exécution et vérification en local (voir « Résultats mesurés » et « Points d'attention »)
+- [x] Exécution et vérification en local (voir « Résultats mesurés »)
 - [ ] Exécution sur un cluster cloud : approche à définir. Les scripts de `aws/` (EMR, S3) n'ont **pas** été exécutés.
 - [ ] Retour critique sur la solution
 - [ ] Support de présentation
@@ -117,11 +111,23 @@ py -3.12 -m pre_commit install
 
 Pour contrôler tout le dépôt à la main : `pre-commit run --all-files` (la première exécution télécharge les environnements des hooks, donc nécessite internet).
 
+### Lancer les tests unitaires
+
+Les tests n'ont besoin ni de Spark ni de TensorFlow : un environnement léger suffit.
+
+```bash
+python3 -m venv ~/venvs/test && source ~/venvs/test/bin/activate
+pip install -r requirements-test.txt
+python -m pytest
+```
+
+Chaque test vérifie une seule fonction de `src/pipeline_utils.py`, de façon isolée : aucun fichier, aucune session Spark ; les images sont fabriquées en mémoire.
+
 ### Ce qui est contrôlé
 
 | Où | Contrôles |
 | --- | --- |
 | Hooks locaux, à chaque commit | pas de commit sur `main` ; fichiers de plus de 1 Mo ; clés privées ; marqueurs de conflit ; YAML valide ; espaces en fin de ligne et fin de fichier (notebooks exclus) ; lint et format avec `ruff` |
-| CI GitHub Actions, à chaque push et pull request vers `develop` ou `main` | les mêmes hooks (sauf l'interdiction de commit sur `main`) ; syntaxe de `src/pipeline.py` ; notebook en JSON valide ; recherche de secrets avec `gitleaks` |
+| CI GitHub Actions, à chaque push et pull request vers `develop` ou `main` | les mêmes hooks (sauf l'interdiction de commit sur `main`) ; syntaxe de `src/pipeline.py` ; notebook en JSON valide ; tests unitaires ; recherche de secrets avec `gitleaks` |
 
-**Limite actuelle :** il n'y a pas encore de tests unitaires. La CI vérifie le style, l'hygiène du dépôt et l'absence de secrets, pas le comportement du pipeline.
+**Limite actuelle :** les tests unitaires couvrent les fonctions pures de `src/pipeline_utils.py`. Le code qui pilote Spark et TensorFlow dans `src/pipeline.py` n'est couvert par aucun test automatique ; il a été vérifié à la main par des exécutions locales.
