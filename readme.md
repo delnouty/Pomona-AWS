@@ -1,114 +1,92 @@
-# Fruits! — Traitement Big Data sur le Cloud (AWS EMR)
+# Fruits! — Chaîne de traitement PySpark : images → features → PCA
 
-Projet : « Réalisez un traitement dans un environnement Big Data sur le Cloud ».
-Chaîne PySpark : images de fruits → features MobileNetV2 (poids broadcastés) → PCA → sortie sur S3.
+Projet P8 : « Réalisez un traitement dans un environnement Big Data sur le Cloud ».
 
-## Livrables
+La start-up AgriTech *Fruits!* veut identifier des fruits à partir de photos. Ce dépôt contient les premières briques de la chaîne de traitement : transformer des images en vecteurs numériques compacts, avec un code écrit en PySpark pour pouvoir passer à l'échelle quand le volume de données augmentera. Aucun modèle n'est entraîné à ce stade.
 
-- [ ] Notebook cloud (EMR) avec scripts PySpark exécutables : preprocessing + PCA
-- [ ] Images du jeu de données initial et sortie de la PCA (CSV/parquet) sur S3
-- [ ] Support de soutenance :
-  - briques d'architecture cloud choisies et leur rôle
-  - démarche de mise en place de l'environnement (EMR)
-  - étapes de la chaîne PySpark
+## Chaîne de traitement
 
-## Structure
+1. **Chargement** : Spark lit les images (`binaryFile`) ; l'étiquette est le nom du dossier parent.
+2. **Extraction de features** : MobileNetV2 pré-entraîné sur ImageNet, sans la couche de classification, donne 1 280 valeurs par image (apprentissage par transfert, pas d'entraînement).
+3. **Diffusion des poids (broadcast)** : les poids du modèle sont envoyés une fois à chaque exécuteur ; chacun reconstruit le réseau (`weights=None`) puis charge les poids reçus, sans rien télécharger.
+4. **Réduction de dimension** : centrage des features, puis PCA de Spark ML. Le nombre de composantes k est le plus petit qui conserve 90 % de la variance.
+5. **Écriture et validation** : résultats en Parquet, courbe de variance en CSV ; contrôle du nombre de lignes et de la taille des vecteurs avant et après la PCA.
 
-| Dossier | Contenu |
-|---|---|
-| `src/pipeline.py` | Script PySpark (local et EMR) |
-| `notebooks/00_alternant_original.ipynb` | Notebook de référence du mode opératoire P8 (intact) : extraction de features, sans PCA. Matériel de cours : local uniquement, non publié |
-| `notebooks/P8_notebook.ipynb` | Notebook du manuel : chaîne complète en local (section 3) et sur EMR (section 4.10), avec broadcast et PCA ; c'est le livrable |
-| `aws/bootstrap-emr.sh`, `aws/aws_steps.sh` | Fichiers du manuel : bootstrap EMR 7 et toutes les commandes AWS numérotées par étape |
-| `aws/emr_create_cluster.sh`, `aws/emr_bootstrap.sh` | Mes scripts d'origine, basés sur EMR 6.3.0 (mode opératoire) ; à comparer avec ceux du manuel |
-| `data/Test/` | Fruits-360 `Test` : 22 688 images, 131 classes (98 Mo), à uploader sur S3 |
-| `data/Training/` | Fruits-360 `Training` : 67 692 images, 131 classes (299 Mo). Pas dans le périmètre de base ; sert au test de passage à l'échelle (3× plus de données) |
-| `docs/P8_Textbook.pdf` | Manuel du projet : théorie, architecture, étapes AWS, soutenance. Local uniquement, non publié |
-| `docs/mode_operatoire/img/` | Captures d'écran du mode opératoire (réutilisables pour la soutenance). Local uniquement, non publié |
-| `docs/` | Architecture, retour critique, support de présentation (à venir) |
+Le centrage est nécessaire : le `transform` de la PCA de Spark ne soustrait pas la moyenne, donc sans lui les coordonnées enregistrées seraient décalées d'un vecteur constant.
 
-## Configuration de référence (mode opératoire P8)
+## Résultats mesurés
 
-| Élément | Valeur |
-|---|---|
-| Région | eu-west-3 (Paris) : conforme RGPD |
-| EMR | emr-6.3.0 : Spark 3.1.1, JupyterHub 1.2.0, application TensorFlow 2.4.1 |
-| Cluster | 1 maître + 2 cœurs, m5.xlarge |
-| Jeu de données | dossier `Test` de Fruits-360 (22 688 images, 131 classes) sur S3 |
-| Notebooks | persistés sur S3 (`jupyter-s3-conf`) |
-| Résultat attendu | traitement des 22 688 images en un peu moins de 8 min |
+Mesures locales (WSL Ubuntu, 4 cores) sur le jeu Fruits-360 :
 
-Écarts par rapport au notebook de référence (ces choix suivent le manuel P8_Textbook) :
+| Exécution | Images | Classes | k pour 90 % de variance | Durée |
+| --- | --- | --- | --- | --- |
+| `src/pipeline.py`, tirage aléatoire dans `Test` | 3 000 | 131 | 170 | 56 s (extraction 26 s, PCA 15 s) |
+| `notebooks/P8_notebook.ipynb`, section 3 | 1 492 | 10 | 44 | extraction 17 s, PCA 5 s |
 
-- ajout de la PCA, précédée d'un centrage (`StandardScaler(withMean=True, withStd=False)`) : le `transform` de Spark ne soustrait pas la moyenne
-- k = plus petit nombre de composantes qui conserve 90 % de la variance, lu sur la courbe de variance cumulée
-- `repartition(2 * sc.defaultParallelism)` : s'adapte à la taille du cluster
-- lots Arrow de 256 images (`maxRecordsPerBatch`)
-- modèle construit avec `include_top=False, pooling="avg"` : même vecteur de 1280 valeurs que `layers[-2]`
+Ces valeurs de k dépendent de l'échantillon : sur la totalité des 22 688 images de `Test`, elles seront différentes.
 
-Le manuel utilise EMR 7.x (TensorFlow installé par le bootstrap) alors que la configuration ci-dessus vient du mode opératoire (EMR 6.3.0). À trancher par un essai réel sur AWS ; en cas d'échec d'EMR 7, garder 6.3.0 et le justifier dans le retour critique.
+## Points d'attention mesurés
 
-## Organisation S3
+- **Utiliser plus d'images que de features (au moins ~1 500) pour tester la PCA.** Avec 300 images (moins que les 1 280 features), la PCA de Spark a renvoyé des composantes fausses et différentes d'un lancement à l'autre : pour le même k = 95, la variance captée valait 90,1 % deux fois et 58,9 % une fois ; pour k = 50, 44,6 % au lieu de 79,7 %. Avec 3 000 images, Spark coïncide avec un calcul NumPy de référence sur tous les ajustements répétés. La cause exacte n'est pas établie ; le cas coïncide avec un nombre d'images inférieur au nombre de features. Le script affiche un `ATTENTION` quand l'échantillon est trop petit ou quand la courbe et le modèle ajusté divergent.
+- **Limiter les cores en local (`--cores 4` par défaut).** Chaque tâche lance un worker Python qui charge TensorFlow. Avec `local[*]` sur 22 cores, le processus Spark s'est arrêté sur 3 000 images. Cause probable : la mémoire, non confirmée par un journal système.
+- **Lire les images depuis le système de fichiers Linux.** Sous WSL, 300 images : 2 min 28 depuis le disque Windows (`/mnt/c`), 41 s depuis le disque Linux.
 
-```text
-s3://<bucket-eu>/
-├── Test/<classe>/*.jpg    # images d'origine
-├── Results/               # features MobileNetV2, 1280 valeurs (parquet)
-├── Results_PCA/           # features réduites à k valeurs (parquet)
-├── Results_PCA_variance/  # courbe de variance expliquée (CSV)
-├── bootstrap-emr.sh       # actions d'amorçage EMR
-├── jupyter/               # notebooks JupyterHub (persistance S3)
-└── logs/                  # logs EMR
-```
+## Lancer en local
 
-## Contraintes
-
-- **RGPD** : bucket S3 et cluster EMR dans une région européenne (eu-west-3).
-- **Budget < 10 €** : cluster allumé uniquement pour les tests et la démo ; développement en local sur un échantillon ; arrêt automatique après 1 h d'inactivité ; terminaison manuelle après chaque session.
-- **Aucun secret dans le dépôt** : clés AWS via `aws configure` uniquement.
-
-## Environnement local
-
-Le développement local se fait sous WSL Ubuntu 24.04 (Python 3.12), comme dans le mode opératoire. Python 3.13 sous Windows n'est pas compatible avec PySpark et TensorFlow. Java 17 est requis par Spark.
+Prérequis : Linux ou WSL, Java 17, Python 3.10 à 3.12 (testé avec 3.12).
 
 ```bash
-# une seule fois (demande le mot de passe sudo)
-sudo apt update && sudo apt install -y openjdk-17-jre-headless python3-venv python3-pip
-
-# le venv reste dans le home WSL (plus rapide que /mnt/c)
 python3 -m venv ~/venvs/fruits
 source ~/venvs/fruits/bin/activate
-cd /mnt/c/Users/DFILATOVA/Desktop/Fruits-AWS
 pip install -r requirements.txt
+```
 
-# les images aussi sont lues bien plus vite depuis le système de fichiers Linux
-mkdir -p ~/p8/data && cp -r data/Test ~/p8/data/Test
+Données : le jeu [Fruits-360](https://www.kaggle.com/datasets/moltean/fruits) (images 100 × 100, 131 classes ; dossier `Test` : 22 688 images). Il n'est pas versionné ; placer le dossier `Test` hors du dépôt, par exemple dans `~/p8/data/Test`.
 
-# --limit 3000 : tirage aléatoire de 3000 images dans Test
+```bash
 python src/pipeline.py --local --input ~/p8/data/Test --output ~/p8/output --limit 3000
 ```
 
-Points mesurés pendant les tests locaux :
+| Option | Rôle |
+| --- | --- |
+| `--local` | session Spark locale ; à omettre sur un cluster |
+| `--cores` | cores de la session locale (défaut 4) |
+| `--limit` | tire au hasard N images (graine fixe) ; 0 = toutes |
+| `--threshold` | part de variance à conserver pour choisir k (défaut 0,90) |
+| `--n-components` | impose k au lieu de le déduire du seuil |
+| `--k-max` | nombre maximal de composantes étudiées pour la courbe (défaut 300) |
+| `--partitions` | partitions avant le réseau (défaut : 2 par core) |
 
-- **Au moins ~1500 images pour un test de la PCA.** Avec moins d'images que de features (1280), la matrice de covariance est de rang n-1 et la PCA de Spark a renvoyé des composantes fausses, différentes d'un lancement à l'autre (variance captée 59 % au lieu de 90 % pour le même k). Avec 3000 images, les résultats de Spark coïncident avec un calcul NumPy de référence, sur plusieurs ajustements. Le script affiche un `ATTENTION` dans les deux cas risqués.
-- **`--cores 4` par défaut en local.** Chaque tâche lance un worker Python qui charge TensorFlow ; avec `local[*]` (22 cores ici) le processus Spark s'est arrêté sur 3000 images. Cause probable : mémoire, non confirmée par un journal système.
-- **Données sur `/mnt/c` : lentes.** 300 images : 2 min 28 depuis `/mnt/c`, 41 s depuis `~/p8/data`.
+Sorties dans le dossier `--output` : `Results/` (features, 1 280 valeurs), `Results_PCA/` (features réduites à k valeurs) et `Results_PCA_variance/` (courbe de variance expliquée, CSV).
 
-## Utilisation sur EMR
+## Notebook
 
-Voir `aws/emr_create_cluster.sh` (chemins `s3://` en entrée et en sortie).
+`notebooks/P8_notebook.ipynb` déroule la même chaîne, étape par étape, avec les explications (en français).
 
-## État d'avancement
+- **Section 3** : exécution locale. Elle lit un échantillon `~/p8/data/Test_local` (quelques variétés de `Test`, plus de 1 280 images au total) et écrit dans `~/p8/output`. À lancer avec un noyau Python qui dispose des paquets de `requirements.txt` ; le nombre de cores se règle avec `N_CORES`.
+- **Section 4** : déploiement sur un cluster cloud. Non exécutée dans ce dépôt (voir « Périmètre et état »).
 
-- [x] Squelette du projet, version initiale de `pipeline.py` (non testée)
-- [x] Notebook de référence et captures importés
-- [x] Java 17 et venv Python installés sous WSL
-- [x] Jeu de données extrait (`data/Test`, `data/Training`)
-- [x] `pipeline.py` aligné sur le manuel : centrage avant la PCA, k à 90 % de variance, dossiers `Results*`, `repartition(2 × cores)`
-- [x] Test local sur 3000 images : 131 classes, k = 170 pour 90,0 % de variance, 56 s avec 4 cores ; PCA de Spark vérifiée contre NumPy
-- [x] Notebook et scripts du manuel ajoutés (`notebooks/P8_notebook.ipynb`, `aws/bootstrap-emr.sh`, `aws/aws_steps.sh`)
-- [ ] Exécuter la section 3 du notebook en local (voir ses réglages : `local[*]` et 150 images, cf. « Points mesurés »)
-- [ ] Aligner `aws/` sur le manuel (EMR 7.x, bootstrap) après essai réel
-- [ ] Bucket S3, rôles IAM, paire de clés, cluster EMR
-- [ ] Exécution sur EMR, résultats sur S3, cluster terminé
-- [ ] Retour critique et support de soutenance
+## Contenu du dépôt
+
+| Fichier | Rôle |
+| --- | --- |
+| `src/pipeline.py` | chaîne complète en un script (local ou cluster) |
+| `notebooks/P8_notebook.ipynb` | notebook explicatif |
+| `requirements.txt` | versions figées : PySpark 3.5.3, TensorFlow CPU 2.16.2, Keras 3.5.0, NumPy 1.26.4, pandas 2.2.3, PyArrow 17.0.0, Pillow 10.4.0 |
+| `aws/` | scripts de déploiement sur AWS EMR, fournis à titre de référence |
+| `.gitignore`, `.gitattributes` | exclusions (données, résultats, clés, environnements) ; fins de ligne LF pour les scripts `.sh` |
+
+## Périmètre et état
+
+- [x] Chaîne PySpark complète : chargement, extraction MobileNetV2, broadcast des poids, centrage, PCA, validation
+- [x] Exécution et vérification en local (voir « Résultats mesurés » et « Points d'attention »)
+- [ ] Exécution sur un cluster cloud : approche à définir. Les scripts de `aws/` (EMR, S3) n'ont **pas** été exécutés.
+- [ ] Retour critique sur la solution
+- [ ] Support de présentation
+
+Contraintes du sujet : en cas de déploiement cloud, serveurs situés dans l'Union européenne (RGPD) et coût maîtrisé (cluster allumé uniquement pour les tests). Les images Fruits-360 ne contiennent pas de données personnelles ; une exécution locale ne transfère aucune donnée.
+
+## Branches
+
+- `develop` : travail en cours.
+- `main` : versions stables ; pas de poussée directe.
