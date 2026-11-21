@@ -16,12 +16,10 @@ Exemples :
     spark-submit src/pipeline.py --input s3://<bucket>/Test --output s3://<bucket>
 """
 
-import argparse
-import io
 import time
+from pathlib import Path
 from typing import Iterator
 
-import numpy as np
 import pandas as pd
 from pyspark.ml.feature import PCA, StandardScaler
 from pyspark.ml.functions import array_to_vector, vector_to_array
@@ -29,8 +27,20 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.functions import pandas_udf
 
-IMG_SIZE = (224, 224)  # taille d'entrée attendue par MobileNetV2
-N_FEATURES = 1280  # taille du vecteur de sortie de MobileNetV2
+from pipeline_utils import (
+    IMG_SIZE,
+    N_FEATURES,
+    build_parser,
+    check_results,
+    max_components,
+    output_paths,
+    select_k,
+    stack_batch,
+    threshold_reached,
+    too_few_images,
+    variance_mismatch,
+    variance_table,
+)
 
 
 def build_model(weights=None):
@@ -58,7 +68,6 @@ def make_featurize_udf(broadcast_weights):
     @pandas_udf("array<float>")
     def featurize(content_iter: Iterator[pd.Series]) -> Iterator[pd.Series]:
         from keras.applications import mobilenet_v2
-        from PIL import Image
 
         preprocess_input = mobilenet_v2.preprocess_input
 
@@ -66,16 +75,7 @@ def make_featurize_udf(broadcast_weights):
         model.set_weights(broadcast_weights.value)
 
         for contents in content_iter:
-            batch = np.stack(
-                [
-                    np.asarray(
-                        Image.open(io.BytesIO(raw)).convert("RGB").resize(IMG_SIZE),
-                        dtype=np.float32,
-                    )
-                    for raw in contents
-                ]
-            )
-            features = model.predict(preprocess_input(batch), verbose=0)
+            features = model.predict(preprocess_input(stack_batch(contents)), verbose=0)
             yield pd.Series(list(features))
 
     return featurize
@@ -103,43 +103,13 @@ def build_spark(local, cores):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument("--input", required=True, help="dossier des images (local ou s3://)")
-    parser.add_argument("--output", required=True, help="dossier de sortie (local ou s3://)")
-    parser.add_argument(
-        "--local", action="store_true", help="session Spark locale ; à omettre sur EMR"
-    )
-    parser.add_argument(
-        "--cores", type=int, default=4, help="cores de la session locale (avec --local uniquement)"
-    )
-    parser.add_argument(
-        "--limit", type=int, default=0, help="limite le nombre d'images (tests locaux), 0 = toutes"
-    )
-    parser.add_argument(
-        "--threshold", type=float, default=0.90, help="part de variance à conserver pour choisir k"
-    )
-    parser.add_argument(
-        "--n-components", type=int, default=None, help="impose k au lieu de le déduire du seuil"
-    )
-    parser.add_argument(
-        "--k-max",
-        type=int,
-        default=300,
-        help="nombre maximal de composantes étudiées pour la courbe",
-    )
-    parser.add_argument(
-        "--partitions", type=int, default=None, help="partitions avant le CNN (défaut : 2 par core)"
-    )
-    args = parser.parse_args()
-
-    path_result = f"{args.output}/Results"  # features (1280 valeurs)
-    path_pca = f"{args.output}/Results_PCA"  # features après PCA
-    path_variance = f"{args.output}/Results_PCA_variance"  # variance expliquée (CSV)
+    args = build_parser(__doc__).parse_args()
+    paths = output_paths(args.output)
 
     spark = build_spark(args.local, args.cores)
     sc = spark.sparkContext
+    # Les workers Python importent pipeline_utils (utilisé par l'UDF) : on leur envoie le module
+    sc.addPyFile(str(Path(__file__).with_name("pipeline_utils.py")))
 
     # 1. Images + labels (le label est le nom du dossier parent de chaque image)
     images = (
@@ -178,7 +148,7 @@ def main():
     )
 
     t0 = time.time()
-    features_df.write.mode("overwrite").parquet(path_result)
+    features_df.write.mode("overwrite").parquet(paths["features"])
     seconds_features = round(time.time() - t0, 1)
     print(f"Extraction des features : {seconds_features} s")
 
@@ -187,7 +157,7 @@ def main():
     # son transform ne soustrait pas la moyenne : sans centrage, les coordonnées
     # enregistrées seraient décalées d'un vecteur constant.
     t0 = time.time()
-    features = spark.read.parquet(path_result).withColumn(
+    features = spark.read.parquet(paths["features"]).withColumn(
         "features_vec", array_to_vector("features")
     )
     scaler = StandardScaler(
@@ -195,7 +165,7 @@ def main():
     ).fit(features)
     centered = scaler.transform(features).cache()  # réutilisé par plusieurs actions
     n_rows = centered.count()
-    if n_rows <= N_FEATURES:
+    if too_few_images(n_rows):
         # Mesuré : avec moins d'images que de features la matrice de covariance est de
         # rang n-1 et la PCA de Spark peut renvoyer des composantes fausses, qui
         # changent d'un lancement à l'autre. Au-delà de 1280 images, elle est exacte.
@@ -205,29 +175,24 @@ def main():
         )
 
     # Courbe de variance : au plus n-1 composantes portent de la variance
-    k_max = int(min(args.k_max, n_rows - 1, N_FEATURES))
+    k_max = max_components(args.k_max, n_rows)
     pca_full = PCA(k=k_max, inputCol="features_centered", outputCol="pca_tmp").fit(centered)
-    explained = pca_full.explainedVariance.toArray()
-    variance = pd.DataFrame(
-        {"k": np.arange(1, k_max + 1), "explained": explained, "cumulative": np.cumsum(explained)}
-    )
+    variance = variance_table(pca_full.explainedVariance.toArray())
     (
         spark.createDataFrame(variance)
         .coalesce(1)
         .write.mode("overwrite")
-        .csv(path_variance, header=True)
+        .csv(paths["variance"], header=True)
     )
 
-    if args.n_components:
-        if args.n_components > k_max:
-            raise SystemExit(f"--n-components ({args.n_components}) dépasse k_max ({k_max})")
-        k = args.n_components
-    elif (variance.cumulative >= args.threshold).any():
-        k = int(variance.loc[variance.cumulative >= args.threshold, "k"].min())
-    else:
-        k = k_max
+    try:
+        k = select_k(variance.cumulative, args.threshold, args.n_components)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if not args.n_components and not threshold_reached(variance.cumulative, args.threshold):
         print(f"Seuil de {args.threshold:.0%} non atteint avec {k_max} composantes")
-    print(f"k = {k} composantes conservent {variance.cumulative.iloc[k - 1]:.1%} de la variance")
+    curve_variance = float(variance.cumulative.iloc[k - 1])
+    print(f"k = {k} composantes conservent {curve_variance:.1%} de la variance")
 
     pca_model = PCA(k=k, inputCol="features_centered", outputCol="pca_vec").fit(centered)
     pca_df = (
@@ -235,34 +200,28 @@ def main():
         .withColumn("pca_features", vector_to_array("pca_vec"))
         .select("path", "label", "pca_features")
     )
-    pca_df.write.mode("overwrite").parquet(path_pca)
+    pca_df.write.mode("overwrite").parquet(paths["pca"])
     centered.unpersist()
     seconds_pca = round(time.time() - t0, 1)
     variance_kept = float(pca_model.explainedVariance.toArray().sum())
     print(f"PCA écrite en {seconds_pca} s ; variance conservée : {variance_kept:.1%}")
     # Le modèle final et la courbe viennent de deux ajustements : ils doivent coïncider
-    if abs(variance_kept - float(variance.cumulative.iloc[k - 1])) > 1e-3:
+    if variance_mismatch(variance_kept, curve_variance):
         print(
             f"ATTENTION : variance du modèle ({variance_kept:.1%}) différente de la "
-            f"courbe ({variance.cumulative.iloc[k - 1]:.1%}) : PCA non fiable, "
+            f"courbe ({curve_variance:.1%}) : PCA non fiable, "
             f"ne pas utiliser ces résultats"
         )
 
     # 4. Validation : on relit ce qui a été écrit, sans tout ramener sur le driver
-    result = spark.read.parquet(path_pca)
+    result = spark.read.parquet(paths["pca"])
     n_result = result.count()
     sample = result.limit(5).toPandas()
-    n_features = len(spark.read.parquet(path_result).first()["features"])
+    n_features = len(spark.read.parquet(paths["features"]).first()["features"])
+    pca_length = len(sample.loc[0, "pca_features"])
     print(f"lignes : {n_result} | attendu : {n_images}")
-    print(
-        f"features avant PCA : {n_features} | après PCA : "
-        f"{len(sample.loc[0, 'pca_features'])} | k = {k}"
-    )
-    assert (
-        n_result == n_images
-        and n_features == N_FEATURES
-        and len(sample.loc[0, "pca_features"]) == k
-    )
+    print(f"features avant PCA : {n_features} | après PCA : {pca_length} | k = {k}")
+    check_results(n_result, n_images, n_features, pca_length, k)
     print(f"images : {n_images} | classes : {n_labels} | cores : {sc.defaultParallelism}")
     print(
         f"extraction : {seconds_features} s | PCA : {seconds_pca} s | k = {k} "

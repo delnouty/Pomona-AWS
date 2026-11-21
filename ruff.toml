@@ -1,6 +1,9 @@
 line-length = 100
 target-version = "py310"
 
+# Dossier du code du projet : permet à ruff de reconnaître pipeline_utils comme module local
+src = ["src"]
+
 # Le notebook est hors du périmètre du lint pour l'instant ;
 # force-exclude s'applique aussi aux fichiers que pre-commit passe explicitement.
 extend-exclude = ["*.ipynb"]
